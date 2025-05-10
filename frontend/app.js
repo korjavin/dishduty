@@ -79,7 +79,23 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Fetch and Display Calendar ---
     async function fetchAndDisplayCalendar() {
         try {
-            const data = await fetchData(`${API_BASE_URL}/calendar`);
+            const today = new Date();
+            const startDate = new Date(today);
+            startDate.setDate(today.getDate() - 7);
+            const endDate = new Date(today);
+            endDate.setDate(today.getDate() + 7);
+
+            const formatDate = (date) => {
+                const yyyy = date.getFullYear();
+                const mm = String(date.getMonth() + 1).padStart(2, '0'); // Months are 0-indexed
+                const dd = String(date.getDate()).padStart(2, '0');
+                return `${yyyy}-${mm}-${dd}`;
+            };
+
+            const startDateStr = formatDate(startDate);
+            const endDateStr = formatDate(endDate);
+
+            const data = await fetchData(`${API_BASE_URL}/calendar?start_date=${startDateStr}&end_date=${endDateStr}`);
             renderCalendar(data.calendar);
         } catch (error) {
             calendarGridEl.innerHTML = '<p style="color:red;">Error loading calendar data.</p>';

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -306,25 +308,28 @@ func main() {
 		if workersCollection != nil && workersCollection.Id != "" {
 			workerNames := []string{"keromag", "megatorg", "baby-ch"}
 			for _, name := range workerNames {
-				// In v0.19.4, FindRecordsByFilter has a different signature
-				records, err := dao.FindRecordsByFilter(workersCollection.Name, "LOWER(name) = LOWER({:name})", "id", 0, 1, dbx.Params{"name": name})
-				count := len(records)
-				if err != nil {
-					log.Printf("Error checking if worker '%s' exists: %v", name, err)
-					continue
-				}
+				// Check if worker already exists using FindFirstRecordByFilter and dbx.NewExp
+				// Using LOWER to maintain case-insensitivity as in the original attempt
+				_, err := dao.FindFirstRecordByFilter(workersCollection.Name, "LOWER(name) = LOWER({:name})", dbx.Params{"name": name})
 
-				if count == 0 {
+				if err == nil {
+					// Record found, worker exists
+					log.Printf("Worker '%s' already exists. Skipping.", name)
+					continue
+				} else if errors.Is(err, sql.ErrNoRows) {
+					// Worker does not exist, proceed to create
 					record := models.NewRecord(workersCollection)
 					record.Set("name", name)
 					// last_assigned_date is optional, not setting it.
-					if err := dao.SaveRecord(record); err != nil {
-						log.Printf("Error seeding worker '%s': %v", name, err)
+					if errSave := dao.SaveRecord(record); errSave != nil {
+						log.Printf("Error seeding worker '%s': %v", name, errSave)
 					} else {
 						log.Printf("Worker '%s' seeded successfully.", name)
 					}
 				} else {
-					log.Printf("Worker '%s' already exists.", name)
+					// Another error occurred
+					log.Printf("Error checking if worker '%s' exists during seeding: %v", name, err)
+					continue
 				}
 			}
 		} else {
@@ -498,10 +503,11 @@ func main() {
 			todayFull := todayYMD + " 00:00:00.000Z"
 
 			// 1. Check if anyone is already assigned for today
+			// Use todayYMD for date comparison
 			existingAssignmentToday, err := dao.FindFirstRecordByFilter(
 				"assignments",
 				"date = {:today} AND status = 'assigned'",
-				dbx.Params{"today": todayFull},
+				dbx.Params{"today": todayYMD},
 			)
 
 			if err != nil && err.Error() != "sql: no rows in result set" {
@@ -519,10 +525,11 @@ func main() {
 			}
 
 			// 2. Process the queue
+			// Use todayYMD for date comparison
 			dueQueueItem, err := dao.FindFirstRecordByFilter(
 				"assignment_queue",
-				"start_date <= {:today} ORDER BY {{order}} ASC", // Process oldest due item first (lowest order)
-				dbx.Params{"today": todayFull},
+				"start_date <= {:today} ORDER BY {{order}} ASC",
+				dbx.Params{"today": todayYMD},
 			)
 
 			if err != nil && err.Error() != "sql: no rows in result set" {
@@ -565,10 +572,11 @@ func main() {
 					assignmentDateFull := assignmentDate + " 00:00:00.000Z"
 
 					// Check if an assignment for this worker and date already exists
+					// Use assignmentDate (YMD)
 					existingAssignment, err := dao.FindFirstRecordByFilter(
 						"assignments",
 						"worker_id = {:workerId} AND date = {:date}",
-						dbx.Params{"workerId": workerId, "date": assignmentDateFull},
+						dbx.Params{"workerId": workerId, "date": assignmentDate},
 					)
 
 					if err != nil && err.Error() != "sql: no rows in result set" {
@@ -713,12 +721,13 @@ func main() {
 			Path:   "/api/dishduty/current-assignee",
 			Handler: func(c echo.Context) error {
 				todayYMD := getTodayYMDGo()
-				todayFull := todayYMD + " 00:00:00.000Z"
+				// todayFull := todayYMD + " 00:00:00.000Z" // Unused
 
+				// Use todayYMD for date comparison
 				currentAssignment, err := dao.FindFirstRecordByFilter(
 					"assignments",
 					"date = {:today} AND status = 'assigned'",
-					dbx.Params{"today": todayFull},
+					dbx.Params{"today": todayYMD},
 				)
 
 				if err != nil && err.Error() != "sql: no rows in result set" {
@@ -794,17 +803,17 @@ func main() {
 				if requestData.Date == "" {
 					return apis.NewBadRequestError("Bad Request: 'date' (for yesterday's task) is required.", nil)
 				}
-
 				yesterdayYMD := requestData.Date // Expecting YYYY-MM-DD
-				yesterdayFull := yesterdayYMD + " 00:00:00.000Z"
+				// yesterdayFull := yesterdayYMD + " 00:00:00.000Z" // Unused
 				todayYMD := getTodayYMDGo()
-				todayFull := todayYMD + " 00:00:00.000Z"
+				todayFull := todayYMD + " 00:00:00.000Z" // Used later for newTodayAssignment
 
 				// Find the assignment to mark as not done
+				// Use yesterdayYMD for date comparison
 				assignmentToMark, err := dao.FindFirstRecordByFilter(
 					"assignments",
 					"date = {:date}",
-					dbx.Params{"date": yesterdayFull},
+					dbx.Params{"date": yesterdayYMD},
 				)
 
 				if err != nil {
@@ -831,10 +840,11 @@ func main() {
 
 				// Reassign for Today
 				// 1. Cancel/remove any existing assignment for today IF it's not the failed worker
+				// Use todayYMD for date comparison
 				existingTodayAssignment, err := dao.FindFirstRecordByFilter(
 					"assignments",
 					"date = {:today}",
-					dbx.Params{"today": todayFull},
+					dbx.Params{"today": todayYMD},
 				)
 
 				if err != nil && err.Error() != "sql: no rows in result set" {
@@ -895,7 +905,7 @@ func main() {
 					"assignments",
 					"date > {:today} ORDER BY date",
 					"id", 0, 100, // Required parameters for v0.19.4: sort field, offset, limit
-					dbx.Params{"today": todayFull},
+					dbx.Params{"today": todayYMD}, // Corrected to use YMD for date field
 				)
 
 				if err != nil && err.Error() != "sql: no rows in result set" {
@@ -1023,8 +1033,8 @@ func main() {
 					return apis.NewBadRequestError("Bad Request: end_date must be in YYYY-MM-DD format.", nil)
 				}
 
-				startDateFull := startDateParam + " 00:00:00.000Z"
-				endDateFull := endDateParam + " 23:59:59.999Z" // Ensure end of day
+				// startDateFull := startDateParam + " 00:00:00.000Z" // Unused
+				// endDateFull := endDateParam + " 23:59:59.999Z" // Ensure end of day // Unused
 
 				calendarEvents := []map[string]interface{}{}
 
@@ -1033,7 +1043,7 @@ func main() {
 					"assignments",
 					"date >= {:start} AND date <= {:end} ORDER BY date",
 					"id", 0, 100, // Required parameters for v0.19.4: sort field, offset, limit
-					dbx.Params{"start": startDateFull, "end": endDateFull},
+					dbx.Params{"start": startDateParam, "end": endDateParam}, // Corrected to use YMD for date fields
 				)
 
 				if err != nil && err.Error() != "sql: no rows in result set" {
