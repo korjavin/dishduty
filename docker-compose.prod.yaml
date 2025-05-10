@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  backend:
+    image: ghcr.io/korjavin/dishduty/backend:latest
+    ports:
+      - "8090:8090"
+    volumes:
+      - dishduty_pb_data:/pb_data
+    environment:
+      - ADMIN_PASS=${ADMIN_PASS}
+
+  frontend:
+    image: ghcr.io/korjavin/dishduty/frontend:latest
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+
+volumes:
+  dishduty_pb_data:

@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./pb_data:/pb_data
+      - ./pb_hooks:/pb_hooks
+      - ./pb_migrations:/pb_migrations
+    environment:
+      - ADMIN_PASS=devpassword
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html
+    depends_on:
+      - backend

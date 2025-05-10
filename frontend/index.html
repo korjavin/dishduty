@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dish Duty</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <h1>Dish Duty</h1>
+        <nav>
+            <a href="audit_log.html">Audit Log</a>
+        </nav>
+        <div id="current-assignee-container">
+            Currently Assigned: <strong id="current-assignee-name">Loading...</strong>
+        </div>
+    </header>
+
+    <main>
+        <section id="calendar-view">
+            <h2>Calendar</h2>
+            <div id="calendar-grid">
+                <!-- Calendar days will be injected here by JavaScript -->
+            </div>
+        </section>
+
+        <section id="actions">
+            <h2>Actions</h2>
+            <div id="add-to-queue-container">
+                <h3>Add to Queue</h3>
+                <form id="add-to-queue-form">
+                    <div>
+                        <label for="worker-select">Worker:</label>
+                        <select id="worker-select" name="worker" required>
+                            <!-- Worker options will be populated by JavaScript -->
+                        </select>
+                    </div>
+                    <div>
+                        <label for="duration-input">Duration (days):</label>
+                        <input type="number" id="duration-input" name="duration" min="1" max="7" value="1" required>
+                    </div>
+                    <button type="submit">Add to Queue</button>
+                </form>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2025 Dish Duty</p>
+    </footer>
+
+    <!-- Modal for Admin Password -->
+    <div id="admin-password-modal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <span class="close-button">&times;</span>
+            <h3>Admin Password Required</h3>
+            <input type="password" id="admin-password-input" placeholder="Enter admin password">
+            <button id="admin-password-submit">Submit</button>
+            <p id="admin-action-feedback" class="feedback"></p>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
