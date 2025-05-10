@@ -1,10 +1,9 @@
 // @ts-check
 /// <reference path="../pb_data/types.d.ts" />
 
-/**
- * @param {import('pocketbase').Dao} dao
- */
-module.exports.up = async (dao) => {
+migrate((db) => {
+  const dao = new Dao(db);
+
   const collections = [
     {
       name: "workers",
@@ -41,7 +40,7 @@ module.exports.up = async (dao) => {
           type: "relation",
           required: true,
           options: {
-            collectionId: "_pb_users_auth_", // Placeholder, will be updated by collection name
+            collectionId: "_pb_users_auth_", // Placeholder, will be updated
             cascadeDelete: false,
             minSelect: null,
             maxSelect: 1,
@@ -52,7 +51,7 @@ module.exports.up = async (dao) => {
           name: "date",
           type: "date",
           required: true,
-          unique: true, // Unique for a given day (Pocketbase date field stores datetime)
+          unique: true, 
           options: {
             min: "",
             max: "",
@@ -165,7 +164,7 @@ module.exports.up = async (dao) => {
           type: "json",
           required: false,
           options: {
-            maxSize: 2000000, // Default max size
+            maxSize: 2000000,
           },
         },
       ],
@@ -179,87 +178,47 @@ module.exports.up = async (dao) => {
     },
   ];
 
-  const workersCollection = collections.find(c => c.name === "workers");
-  if (!workersCollection) throw new Error("Workers collection definition not found");
-
-  // Update relation fields to point to the actual workers collection ID
-  for (const colDef of collections) {
-    if (colDef.name === "assignments" || colDef.name === "assignment_queue") {
-      const workerIdField = colDef.schema.find(f => f.name === "worker_id");
-      if (workerIdField && workerIdField.type === "relation") {
-        // This ID will be dynamically assigned by PocketBase when 'workers' is created.
-        // In a real migration, you'd fetch the 'workers' collection first, get its ID,
-        // then use it. For this static definition, we'll assume PocketBase handles
-        // resolving this by name or we'd need a multi-step migration.
-        // For now, we'll set it to the name, and PocketBase's JS migration runner
-        // might resolve it or this would need to be adjusted.
-        // A safer approach is to create workers first, then other collections.
-        // Let's adjust the logic to create workers first.
-      }
-    }
-  }
-
   // Create workers collection first to get its ID
   const workersCollectionDef = collections.find(c => c.name === "workers");
   if (!workersCollectionDef) throw new Error("Workers collection definition not found");
   
-  const existingWorkersCollection = await dao.findCollectionByNameOrId("workers").catch(() => null);
-  let actualWorkersCollectionId = existingWorkersCollection?.id;
-
-  if (!existingWorkersCollection) {
-    // Pass the definition directly
-    const savedWorkersCollection = await dao.saveCollection(workersCollectionDef);
+  let actualWorkersCollectionId = "";
+  try {
+    const existingWorkersCollection = dao.findCollectionByNameOrId("workers");
+    actualWorkersCollectionId = existingWorkersCollection.id;
+  } catch (_) {
+    // Collection does not exist, create it
+    const savedWorkersCollection = dao.saveCollection(new Collection(workersCollectionDef));
     actualWorkersCollectionId = savedWorkersCollection.id;
   }
 
 
-  for (const colDef of collections) {
-    if (colDef.name === "workers") continue; // Already created or existed
+  for (const colDefData of collections) {
+    if (colDefData.name === "workers") continue; // Already created or existed
 
     // Update relation collectionId for assignments and assignment_queue
-    if (colDef.name === "assignments" || colDef.name === "assignment_queue") {
-        const workerIdField = colDef.schema.find(f => f.name === "worker_id");
+    if (colDefData.name === "assignments" || colDefData.name === "assignment_queue") {
+        const workerIdField = colDefData.schema.find(f => f.name === "worker_id");
         if (workerIdField && workerIdField.type === "relation") {
             workerIdField.options.collectionId = actualWorkersCollectionId;
         }
     }
-    if (colDef.name === "assignments") {
-        const statusField = colDef.schema.find(f => f.name === "status");
-        if (statusField) {
-            // @ts-ignore
-            statusField.options.values.unshift("assigned"); // Ensure default is first
-            // @ts-ignore
-            statusField.default = "assigned"; // PocketBase JS SDK might not directly support default in schema definition this way
-                                            // Default values for select are usually handled by setting the first value as default
-                                            // or at application level. The schema implies the first value is default.
-        }
-    }
-     if (colDef.name === "action_log") {
-        const timestampField = colDef.schema.find(f => f.name === "timestamp");
-        if (timestampField) {
-            // Default to now is usually handled by PocketBase automatically for 'created' field
-            // or application logic. For a regular date field, default 'now' isn't a direct schema option.
-            // This will be set at record creation time.
-        }
-    }
+    
+    // The logic for default status and timestamp is generally handled by PocketBase
+    // or application logic, not directly in schema definition this way for JS migrations.
+    // Ensuring "assigned" is the first value in `status.options.values` is the typical approach.
 
-
-    const existingCollection = await dao.findCollectionByNameOrId(colDef.name).catch(() => null);
-    if (!existingCollection) {
-      // Pass the definition directly
-      // The logic for setting default 'status' should be part of the colDef if possible,
-      // or handled by ensuring "assigned" is the first in the values array within colDef.
-      // The existing colDef for assignments already has "assigned" as the first value in its schema.
-      // So, no special handling for default status is needed here if the colDef is correct.
-      await dao.saveCollection(colDef);
+    try {
+      dao.findCollectionByNameOrId(colDefData.name);
+      // Collection exists, do nothing or update if needed (not in scope for this task)
+    } catch (_) {
+      // Collection does not exist, create it
+      dao.saveCollection(new Collection(colDefData));
     }
   }
-};
+}, async (db) => {
+  const dao = new Dao(db);
 
-/**
- * @param {import('pocketbase').Dao} dao
- */
-module.exports.down = async (dao) => {
   const collectionNames = [
     "action_log",
     "assignment_queue",
@@ -272,8 +231,7 @@ module.exports.down = async (dao) => {
       const collection = await dao.findCollectionByNameOrId(name);
       await dao.deleteCollection(collection);
     } catch (e) {
-      //อาจจะ collection ไม่มี
       console.warn(`Could not delete collection ${name}: ${e.message}`);
     }
   }
-};
+});
