@@ -3,12 +3,13 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
-	"errors"
+	"errors" // For errors.Is
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"regexp"
+	"strings" // Added for worker existence check
 	"time"
 
 	"github.com/labstack/echo/v5"
@@ -24,10 +25,31 @@ import (
 	// _ "github.com/spf13/cobra"
 )
 
+// CalendarEntry defines the structure for a single calendar item.
+type CalendarEntry struct {
+	Date       string `json:"date"`
+	WorkerID   string `json:"worker_id,omitempty"`
+	WorkerName string `json:"worker_name"`
+	Status     string `json:"status"` // "assigned", "queued", "past_done", "past_not_done"
+}
+
+// CalendarResponse defines the structure for the calendar API response.
+type CalendarResponse struct {
+	Assignments       []CalendarEntry `json:"assignments"`
+	QueuedAssignments []CalendarEntry `json:"queued_assignments"`
+}
+
 const (
 	timeLayoutYMD  = "2006-01-02"
-	timeLayoutFull = "2006-01-02 15:04:05.000Z" // PocketBase default datetime format
+	timeLayoutFull = "2006-01-02 15:04:05.000Z" // PocketBase default datetime format (equivalent to types.DateTimeLayout)
 )
+
+// AddToQueueRequest defines the structure for the add to queue API request.
+type AddToQueueRequest struct {
+	WorkerID      string `json:"worker_id"` // Or WorkerName string `json:"worker_name"`
+	DurationDays  int    `json:"duration_days"`
+	AdminPassword string `json:"admin_password"`
+}
 
 // --- Helper Functions ---
 
@@ -70,13 +92,12 @@ func logActionGo(dao *daos.Dao, actionType string, details map[string]interface{
 
 	record := models.NewRecord(actionLogCollection)
 	record.Set("action_type", actionType)
-	record.Set("timestamp", types.NowDateTime()) // PocketBase uses UTC by default
+	record.Set("timestamp", time.Now().UTC().Format(timeLayoutFull)) // Use timeLayoutFull
 
 	if details != nil {
 		detailsJSON, jsonErr := json.Marshal(details)
 		if jsonErr != nil {
 			log.Printf("Error marshalling details for action log '%s': %v", actionType, jsonErr)
-			// Decide if you want to log without details or return an error
 			record.Set("details", fmt.Sprintf(`{"error": "failed to marshal details: %s"}`, jsonErr.Error()))
 		} else {
 			record.Set("details", string(detailsJSON))
@@ -104,11 +125,11 @@ func main() {
 			workersCollection = &models.Collection{
 				Name:       "workers",
 				Type:       models.CollectionTypeBase,
-				ListRule:   nil,                                                                   // Public list
-				ViewRule:   nil,                                                                   // Public view
-				CreateRule: types.Pointer("@request.auth.id != '' && @request.auth.admin = true"), // Admin create
-				UpdateRule: types.Pointer("@request.auth.id != '' && @request.auth.admin = true"), // Admin update
-				DeleteRule: types.Pointer("@request.auth.id != '' && @request.auth.admin = true"), // Admin delete
+				ListRule:   nil,
+				ViewRule:   nil,
+				CreateRule: types.Pointer("@request.auth.id != '' && @request.auth.admin = true"),
+				UpdateRule: types.Pointer("@request.auth.id != '' && @request.auth.admin = true"),
+				DeleteRule: types.Pointer("@request.auth.id != '' && @request.auth.admin = true"),
 				Schema: schema.NewSchema(
 					&schema.SchemaField{
 						Name:     "name",
@@ -123,7 +144,7 @@ func main() {
 						Type:     schema.FieldTypeDate,
 						Required: false,
 						System:   false,
-						Options:  &schema.DateOptions{Min: types.DateTime{}, Max: types.DateTime{}},
+						Options:  &schema.DateOptions{},
 					},
 				),
 			}
@@ -135,11 +156,51 @@ func main() {
 		} else {
 			log.Println("'workers' collection already exists.")
 			workersCollection = existingWorkers
+
+			rulesChanged := false
+			// Ensure ListRule is nil for public access
+			if workersCollection.ListRule != nil {
+				workersCollection.ListRule = nil
+				rulesChanged = true
+			}
+			// Ensure ViewRule is nil for public access
+			if workersCollection.ViewRule != nil {
+				workersCollection.ViewRule = nil
+				rulesChanged = true
+			}
+
+			// Ensure CUD rules are for admin only, consistent with initial creation logic
+			// Initial creation uses: types.Pointer("@request.auth.id != '' && @request.auth.admin = true")
+			// The instruction uses @request.admin = true. We'll stick to @request.auth.admin for consistency with how it's defined at creation.
+			expectedAdminCudRule := types.Pointer("@request.auth.id != '' && @request.auth.admin == true")
+
+			if workersCollection.CreateRule == nil || *workersCollection.CreateRule != *expectedAdminCudRule {
+				workersCollection.CreateRule = expectedAdminCudRule
+				rulesChanged = true
+			}
+			if workersCollection.UpdateRule == nil || *workersCollection.UpdateRule != *expectedAdminCudRule {
+				workersCollection.UpdateRule = expectedAdminCudRule
+				rulesChanged = true
+			}
+			if workersCollection.DeleteRule == nil || *workersCollection.DeleteRule != *expectedAdminCudRule {
+				workersCollection.DeleteRule = expectedAdminCudRule
+				rulesChanged = true
+			}
+
+			if rulesChanged {
+				if err := dao.SaveCollection(workersCollection); err != nil {
+					log.Printf("Error saving 'workers' collection with updated rules: %v", err)
+					return fmt.Errorf("failed to save workers collection with updated rules: %w", err)
+				}
+				log.Println("'workers' collection API rules explicitly set/updated for public read and admin CUD.")
+			} else {
+				log.Println("'workers' collection API rules already conform to public read and admin CUD.")
+			}
 		}
 
 		if workersCollection == nil || workersCollection.Id == "" {
-			log.Println("Critical error: 'workers' collection could not be initialized. Aborting schema setup.")
-			return apis.NewNotFoundError("Workers collection not found and could not be created.", nil) // Changed to apis.NewNotFoundError
+			log.Println("Critical error: 'workers' collection could not be initialized.")
+			return errors.New("workers collection not found and could not be created")
 		}
 
 		// --- Define Assignments Collection ---
@@ -150,36 +211,32 @@ func main() {
 				Type:       models.CollectionTypeBase,
 				ListRule:   nil,
 				ViewRule:   nil,
-				CreateRule: types.Pointer("@request.auth.id != ''"), // Authenticated users
-				UpdateRule: types.Pointer("@request.auth.id != ''"), // Authenticated users
-				DeleteRule: types.Pointer("@request.auth.id != ''"), // Authenticated users
+				CreateRule: types.Pointer("@request.auth.id != ''"),
+				UpdateRule: types.Pointer("@request.auth.id != ''"),
+				DeleteRule: types.Pointer("@request.auth.id != ''"),
 				Schema: schema.NewSchema(
 					&schema.SchemaField{
 						Name:     "worker_id",
 						Type:     schema.FieldTypeRelation,
 						Required: true,
-						System:   false,
 						Options: &schema.RelationOptions{
 							CollectionId:  workersCollection.Id,
 							CascadeDelete: false,
 							MinSelect:     types.Pointer(1),
 							MaxSelect:     types.Pointer(1),
-							DisplayFields: nil,
 						},
 					},
 					&schema.SchemaField{
 						Name:     "date",
 						Type:     schema.FieldTypeDate,
 						Required: true,
-						Unique:   true, // One assignment record per date globally
-						System:   false,
-						Options:  &schema.DateOptions{Min: types.DateTime{}, Max: types.DateTime{}},
+						Unique:   true,
+						Options:  &schema.DateOptions{},
 					},
 					&schema.SchemaField{
 						Name:     "status",
 						Type:     schema.FieldTypeSelect,
-						Required: false, // Default "assigned" (first option)
-						System:   false,
+						Required: true,
 						Options: &schema.SelectOptions{
 							MaxSelect: 1,
 							Values:    []string{"assigned", "done", "not_done"},
@@ -204,48 +261,17 @@ func main() {
 				Type:       models.CollectionTypeBase,
 				ListRule:   nil,
 				ViewRule:   nil,
-				CreateRule: types.Pointer("@request.auth.id != '' && @request.auth.admin = true"), // Admin manages queue
+				CreateRule: types.Pointer("@request.auth.id != '' && @request.auth.admin = true"),
 				UpdateRule: types.Pointer("@request.auth.id != '' && @request.auth.admin = true"),
 				DeleteRule: types.Pointer("@request.auth.id != '' && @request.auth.admin = true"),
 				Schema: schema.NewSchema(
 					&schema.SchemaField{
-						Name:     "worker_id",
-						Type:     schema.FieldTypeRelation,
-						Required: true,
-						System:   false,
-						Options: &schema.RelationOptions{
-							CollectionId:  workersCollection.Id,
-							CascadeDelete: false,
-							MinSelect:     types.Pointer(1),
-							MaxSelect:     types.Pointer(1),
-							DisplayFields: nil,
-						},
+						Name: "worker_id", Type: schema.FieldTypeRelation, Required: true,
+						Options: &schema.RelationOptions{CollectionId: workersCollection.Id, CascadeDelete: false, MinSelect: types.Pointer(1), MaxSelect: types.Pointer(1)},
 					},
-					&schema.SchemaField{
-						Name:     "start_date",
-						Type:     schema.FieldTypeDate,
-						Required: true,
-						System:   false,
-						Options:  &schema.DateOptions{Min: types.DateTime{}, Max: types.DateTime{}},
-					},
-					&schema.SchemaField{
-						Name:     "duration_days",
-						Type:     schema.FieldTypeNumber,
-						Required: true,
-						System:   false,
-						Options: &schema.NumberOptions{
-							Min:       types.Pointer(float64(1)),
-							Max:       types.Pointer(float64(7)),
-							NoDecimal: true, // In v0.19.4, NoDecimal is a direct boolean, not a pointer
-						},
-					},
-					&schema.SchemaField{
-						Name:     "order",
-						Type:     schema.FieldTypeNumber,
-						Required: true,
-						System:   false,
-						Options:  &schema.NumberOptions{NoDecimal: true}, // In v0.19.4, NoDecimal is a direct boolean
-					},
+					&schema.SchemaField{Name: "start_date", Type: schema.FieldTypeDate, Required: true, Options: &schema.DateOptions{}},
+					&schema.SchemaField{Name: "duration_days", Type: schema.FieldTypeNumber, Required: true, Options: &schema.NumberOptions{Min: types.Pointer(1.0), Max: types.Pointer(7.0), NoDecimal: true}},
+					&schema.SchemaField{Name: "order", Type: schema.FieldTypeNumber, Required: true, Options: &schema.NumberOptions{NoDecimal: true}},
 				),
 			}
 			if err := dao.SaveCollection(assignmentQueueCollection); err != nil {
@@ -261,38 +287,13 @@ func main() {
 		existingActionLog, _ := dao.FindCollectionByNameOrId("action_log")
 		if existingActionLog == nil {
 			actionLogCollection := &models.Collection{
-				Name:       "action_log",
-				Type:       models.CollectionTypeBase,
-				ListRule:   types.Pointer("@request.auth.id != '' && @request.auth.admin = true"), // Admin views logs
-				ViewRule:   types.Pointer("@request.auth.id != '' && @request.auth.admin = true"),
-				CreateRule: types.Pointer("@request.auth.id != ''"), // System/app creates logs (any authenticated identity, could be a service account)
-				UpdateRule: types.Pointer(""),                       // Logs are immutable
-				DeleteRule: types.Pointer(""),                       // Logs are not deleted
+				Name: "action_log", Type: models.CollectionTypeBase,
+				ListRule: types.Pointer("@request.auth.id != '' && @request.auth.admin = true"), ViewRule: types.Pointer("@request.auth.id != '' && @request.auth.admin = true"),
+				CreateRule: types.Pointer("@request.auth.id != ''"), UpdateRule: types.Pointer(""), DeleteRule: types.Pointer(""),
 				Schema: schema.NewSchema(
-					&schema.SchemaField{
-						Name:     "timestamp",
-						Type:     schema.FieldTypeDate,
-						Required: true,
-						System:   false,
-						Options:  &schema.DateOptions{Min: types.DateTime{}, Max: types.DateTime{}},
-					},
-					&schema.SchemaField{
-						Name:     "action_type",
-						Type:     schema.FieldTypeSelect,
-						Required: true,
-						System:   false,
-						Options: &schema.SelectOptions{
-							MaxSelect: 1,
-							Values:    []string{"assigned", "added_to_queue", "marked_not_done", "randomly_assigned", "queue_processed"},
-						},
-					},
-					&schema.SchemaField{
-						Name:     "details",
-						Type:     schema.FieldTypeJson,
-						Required: false,
-						System:   false,
-						Options:  &schema.JsonOptions{}, // In v0.19.4, JsonOptions doesn't have a MaxSize field
-					},
+					&schema.SchemaField{Name: "timestamp", Type: schema.FieldTypeDate, Required: true, Options: &schema.DateOptions{}},
+					&schema.SchemaField{Name: "action_type", Type: schema.FieldTypeSelect, Required: true, Options: &schema.SelectOptions{MaxSelect: 1, Values: []string{"assigned", "added_to_queue", "marked_not_done", "randomly_assigned", "queue_processed"}}},
+					&schema.SchemaField{Name: "details", Type: schema.FieldTypeJson, Required: false, Options: &schema.JsonOptions{}},
 				),
 			}
 			if err := dao.SaveCollection(actionLogCollection); err != nil {
@@ -307,29 +308,30 @@ func main() {
 		// --- Seed Initial Workers ---
 		if workersCollection != nil && workersCollection.Id != "" {
 			workerNames := []string{"keromag", "megatorg", "baby-ch"}
-			for _, name := range workerNames {
-				// Check if worker already exists using FindFirstRecordByFilter and dbx.NewExp
-				// Using LOWER to maintain case-insensitivity as in the original attempt
-				_, err := dao.FindFirstRecordByFilter(workersCollection.Name, "LOWER(name) = LOWER({:name})", dbx.Params{"name": name})
+			for _, workerName := range workerNames {
+				var existingRecord models.Record   // Important to declare it to receive the result
+				err := dao.RecordQuery("workers"). // Using dao which is app.Dao()
+									AndWhere(dbx.NewExp("LOWER(name) = LOWER({:workerName})", dbx.Params{"workerName": workerName})).
+									Limit(1).
+									One(&existingRecord) // Use One to fetch into existingRecord
 
-				if err == nil {
-					// Record found, worker exists
-					log.Printf("Worker '%s' already exists. Skipping.", name)
+				if err == nil && existingRecord.Id != "" {
+					log.Printf("Worker '%s' already exists. Skipping.", workerName)
 					continue
-				} else if errors.Is(err, sql.ErrNoRows) {
-					// Worker does not exist, proceed to create
-					record := models.NewRecord(workersCollection)
-					record.Set("name", name)
-					// last_assigned_date is optional, not setting it.
-					if errSave := dao.SaveRecord(record); errSave != nil {
-						log.Printf("Error seeding worker '%s': %v", name, errSave)
-					} else {
-						log.Printf("Worker '%s' seeded successfully.", name)
-					}
+				}
+				// Check specifically for "no rows" or other "not found" variations
+				if err != nil && !(errors.Is(err, sql.ErrNoRows) || strings.Contains(strings.ToLower(err.Error()), "no record found") || strings.Contains(strings.ToLower(err.Error()), "no rows in result set")) {
+					log.Printf("Error checking if worker '%s' exists: %v", workerName, err)
+					continue
+				}
+				// If err is sql.ErrNoRows (or similar) or (err == nil && existingRecord.Id is empty), proceed to create
+				log.Printf("Worker '%s' does not exist or error was 'no rows'. Creating...", workerName)
+				record := models.NewRecord(workersCollection)
+				record.Set("name", workerName)
+				if errSave := dao.SaveRecord(record); errSave != nil {
+					log.Printf("Error seeding worker '%s': %v", workerName, errSave)
 				} else {
-					// Another error occurred
-					log.Printf("Error checking if worker '%s' exists during seeding: %v", name, err)
-					continue
+					log.Printf("Worker '%s' seeded successfully.", workerName)
 				}
 			}
 		} else {
@@ -337,381 +339,121 @@ func main() {
 		}
 
 		// --- API Routes ---
-		// Middleware for admin password check can be implemented per route if password is in body
-		// or as a general middleware if it's a header/query param.
-		// For now, checking within handlers as per JS logic.
+
+		// GET /api/dishduty/workers
+		e.Router.AddRoute(echo.Route{
+			Method: http.MethodGet,
+			Path:   "/api/dishduty/workers", // New dedicated endpoint
+			Handler: func(c echo.Context) error {
+				records, err := app.Dao().FindRecordsByFilter(
+					"workers",
+					"1=1",   // Get all records
+					"+name", // Sort by name ascending
+					0,       // No limit (get all)
+					0,       // No offset
+				)
+				if err != nil {
+					log.Printf("Error fetching workers for API: %v", err)
+					return apis.NewApiError(http.StatusInternalServerError, "Failed to fetch workers.", err)
+				}
+				return c.JSON(http.StatusOK, records)
+			},
+			Middlewares: []echo.MiddlewareFunc{
+				// No admin auth middleware here, this is public
+			},
+		})
 
 		// POST /api/dishduty/queue/add
 		e.Router.AddRoute(echo.Route{
 			Method: http.MethodPost,
 			Path:   "/api/dishduty/queue/add",
 			Handler: func(c echo.Context) error {
-				// In v0.19.4, we use echo.Context directly, not core.RouteEvent
+				var req AddToQueueRequest // Use the new struct type
 
-				requestData := struct {
-					WorkerName    string `json:"worker_name"`
-					WorkerID      string `json:"worker_id"`
-					DurationDays  int    `json:"duration_days"`
-					AdminPassword string `json:"admin_password"`
-				}{}
-
-				if err := c.Bind(&requestData); err != nil {
-					return apis.NewBadRequestError("Failed to parse request data.", err)
+				if err := c.Bind(&req); err != nil {
+					log.Printf("Error binding request for add to queue: %v", err)
+					return apis.NewBadRequestError("Invalid request body.", err)
 				}
 
-				if !isAdminGo(requestData.AdminPassword) {
+				if !isAdminGo(req.AdminPassword) {
 					return apis.NewForbiddenError("Forbidden: Invalid admin password.", nil)
 				}
 
-				if requestData.DurationDays < 1 || requestData.DurationDays > 7 {
-					return apis.NewBadRequestError("Bad Request: duration_days must be between 1 and 7.", nil)
+				// Validate DurationDays
+				if req.DurationDays < 1 || req.DurationDays > 7 {
+					log.Printf("Validation error: duration_days %d out of range", req.DurationDays)
+					return apis.NewBadRequestError("duration_days must be between 1 and 7.", nil)
 				}
 
 				var worker *models.Record
-				var err error
-
-				if requestData.WorkerID != "" {
-					worker, err = dao.FindRecordById("workers", requestData.WorkerID)
-				} else if requestData.WorkerName != "" {
-					worker, err = dao.FindFirstRecordByFilter("workers", "name = {:name}", dbx.Params{"name": requestData.WorkerName})
+				var errFindWorker error
+				// Note: The AddToQueueRequest struct only has WorkerID. If WorkerName is also needed,
+				// the struct and frontend payload should be updated. For now, assuming WorkerID is primary.
+				if req.WorkerID != "" {
+					worker, errFindWorker = dao.FindRecordById("workers", req.WorkerID)
 				} else {
-					return apis.NewBadRequestError("Bad Request: worker_id or worker_name is required.", nil)
+					// If WorkerID is not provided, and WorkerName was an option, this logic would need adjustment.
+					// Based on current struct, WorkerID is expected.
+					return apis.NewBadRequestError("Bad Request: worker_id is required.", nil)
 				}
-
-				if err != nil || worker == nil {
-					log.Printf("Error finding worker (id: %s, name: %s): %v", requestData.WorkerID, requestData.WorkerName, err)
-					return apis.NewNotFoundError("Not Found: Worker not found.", err)
+				if errFindWorker != nil || worker == nil {
+					log.Printf("Error finding worker (id: %s): %v", req.WorkerID, errFindWorker)
+					return apis.NewNotFoundError("Not Found: Worker not found.", errFindWorker)
 				}
 
 				var startDateYMD string
 				order := 1
-
-				// Find the last item in the queue to determine start_date and order
-				lastQueueItem, _ := dao.FindFirstRecordByFilter(
-					"assignment_queue",
-					"1=1 ORDER BY {{order}} DESC", // Use {{}} for field names if they might conflict with SQL keywords
-				)
-
 				todayYMD := getTodayYMDGo()
 
+				lastQueueItem, _ := dao.FindFirstRecordByFilter("assignment_queue", "1=1 ORDER BY {{order}} DESC")
 				if lastQueueItem != nil {
-					lastQueueItemStartDateStr := lastQueueItem.GetString("start_date")
-					lastQueueItemStartDate, parseErr := time.Parse(timeLayoutFull, lastQueueItemStartDateStr)
-					if parseErr != nil {
-						log.Printf("Error parsing lastQueueItem start_date '%s': %v", lastQueueItemStartDateStr, parseErr)
-						return apis.NewApiError(http.StatusInternalServerError, "Error processing queue dates.", parseErr)
-					}
-
+					lastQueueItemStartDate := lastQueueItem.GetTime("start_date")
 					lastQueueItemDuration := lastQueueItem.GetInt("duration_days")
-					// End date of the last queue item is its start_date + duration_days - 1
 					lastQueueItemEndDate := formatDateToYMDGo(lastQueueItemStartDate.AddDate(0, 0, lastQueueItemDuration-1))
-
-					startDateYMD, err = addDaysToYMDGo(lastQueueItemEndDate, 1)
-					if err != nil {
-						log.Printf("Error calculating start date from last queue item: %v", err)
-						return apis.NewApiError(http.StatusInternalServerError, "Error calculating start date.", err)
-					}
+					startDateYMD, _ = addDaysToYMDGo(lastQueueItemEndDate, 1)
 					order = lastQueueItem.GetInt("order") + 1
 				} else {
-					// If queue is empty, check current assignments
-					latestAssignment, _ := dao.FindFirstRecordByFilter(
-						"assignments",
-						"1=1 ORDER BY date DESC",
-					)
+					latestAssignment, _ := dao.FindFirstRecordByFilter("assignments", "1=1 ORDER BY date DESC")
 					if latestAssignment != nil {
-						latestAssignmentDateStr := latestAssignment.GetString("date")
-						latestAssignmentDate, parseErr := time.Parse(timeLayoutFull, latestAssignmentDateStr)
-						if parseErr != nil {
-							log.Printf("Error parsing latestAssignment date '%s': %v", latestAssignmentDateStr, parseErr)
-							return apis.NewApiError(http.StatusInternalServerError, "Error processing assignment dates.", parseErr)
-						}
-
+						latestAssignmentDate := latestAssignment.GetTime("date")
 						latestAssignmentYMD := formatDateToYMDGo(latestAssignmentDate)
 						parsedLatestAssignmentDate, _ := parseYMDToGoTime(latestAssignmentYMD)
 						parsedToday, _ := parseYMDToGoTime(todayYMD)
-
 						if parsedLatestAssignmentDate.After(parsedToday) || parsedLatestAssignmentDate.Equal(parsedToday) {
-							startDateYMD, err = addDaysToYMDGo(latestAssignmentYMD, 1)
+							startDateYMD, _ = addDaysToYMDGo(latestAssignmentYMD, 1)
 						} else {
 							startDateYMD = todayYMD
 						}
-						if err != nil {
-							log.Printf("Error calculating start date from latest assignment: %v", err)
-							return apis.NewApiError(http.StatusInternalServerError, "Error calculating start date.", err)
-						}
 					} else {
-						startDateYMD = todayYMD // No assignments, start today
+						startDateYMD = todayYMD
 					}
 				}
 
-				// Ensure startDateYMD is not in the past relative to today for new queue items
 				parsedStartDate, _ := parseYMDToGoTime(startDateYMD)
 				parsedToday, _ := parseYMDToGoTime(todayYMD)
 				if parsedStartDate.Before(parsedToday) {
 					startDateYMD = todayYMD
 				}
 
-				queueCollection, err := dao.FindCollectionByNameOrId("assignment_queue")
-				if err != nil {
-					return apis.NewApiError(http.StatusInternalServerError, "Failed to find assignment_queue collection.", err)
+				finalStartDateForRecord, errParseFinal := time.Parse(timeLayoutYMD, startDateYMD)
+				if errParseFinal != nil {
+					log.Printf("Error parsing final startDateYMD '%s' for queue: %v", startDateYMD, errParseFinal)
+					return apis.NewApiError(http.StatusInternalServerError, "Error formatting start date for DB.", errParseFinal)
 				}
 
+				queueCollection, _ := dao.FindCollectionByNameOrId("assignment_queue")
 				newQueueRecord := models.NewRecord(queueCollection)
 				newQueueRecord.Set("worker_id", worker.Id)
-
-				// Convert YMD string to full datetime string for PocketBase
-				startDatePBFormat, err := time.Parse(timeLayoutYMD, startDateYMD)
-				if err != nil {
-					log.Printf("Error parsing final startDateYMD '%s' to time.Time: %v", startDateYMD, err)
-					return apis.NewApiError(http.StatusInternalServerError, "Error formatting start date for DB.", err)
-				}
-				// In v0.19.4, format the time directly to string
-				formattedDate := startDatePBFormat.Format(timeLayoutFull)
-				newQueueRecord.Set("start_date", formattedDate)
-				newQueueRecord.Set("duration_days", requestData.DurationDays)
+				newQueueRecord.Set("start_date", finalStartDateForRecord.Format(timeLayoutYMD))
+				newQueueRecord.Set("duration_days", req.DurationDays) // Use req.DurationDays
 				newQueueRecord.Set("order", order)
 
 				if err := dao.SaveRecord(newQueueRecord); err != nil {
 					log.Printf("Error saving new queue record: %v", err)
 					return apis.NewApiError(http.StatusInternalServerError, "Could not add worker to queue.", err)
 				}
-
-				logDetails := map[string]interface{}{
-					"worker_id":     worker.Id,
-					"worker_name":   worker.GetString("name"),
-					"duration_days": requestData.DurationDays,
-					"start_date":    startDateYMD,
-					"order":         order,
-				}
-				if logErr := logActionGo(dao, "added_to_queue", logDetails); logErr != nil {
-					// Log the error but don't fail the request because the main action succeeded
-					log.Printf("Failed to log 'added_to_queue' action: %v", logErr)
-				}
-
-				return c.JSON(http.StatusCreated, map[string]interface{}{
-					"message": "Worker added to queue.",
-					"data":    newQueueRecord,
-				})
-			},
-		})
-		// Note: If ActivityLogger causes issues with your PB version, you might need to remove it or use a different middleware pattern.
-
-		// --- Daily Assignment Logic ---
-		// This function processes the assignment queue and assigns a worker if needed
-		processDailyAssignments := func() (map[string]interface{}, error) {
-			todayYMD := getTodayYMDGo()
-			todayFull := todayYMD + " 00:00:00.000Z"
-
-			// 1. Check if anyone is already assigned for today
-			// Use todayYMD for date comparison
-			existingAssignmentToday, err := dao.FindFirstRecordByFilter(
-				"assignments",
-				"date = {:today} AND status = 'assigned'",
-				dbx.Params{"today": todayYMD},
-			)
-
-			if err != nil && err.Error() != "sql: no rows in result set" {
-				log.Printf("Error checking for existing assignment: %v", err)
-				return nil, fmt.Errorf("failed to check existing assignments: %w", err)
-			}
-
-			if existingAssignmentToday != nil {
-				workerId := existingAssignmentToday.GetString("worker_id")
-				log.Printf("Worker %s already assigned for %s. No action needed.", workerId, todayYMD)
-				return map[string]interface{}{
-					"message":            "Assignment already exists for today.",
-					"assigned_worker_id": workerId,
-				}, nil
-			}
-
-			// 2. Process the queue
-			// Use todayYMD for date comparison
-			dueQueueItem, err := dao.FindFirstRecordByFilter(
-				"assignment_queue",
-				"start_date <= {:today} ORDER BY {{order}} ASC",
-				dbx.Params{"today": todayYMD},
-			)
-
-			if err != nil && err.Error() != "sql: no rows in result set" {
-				log.Printf("Error checking queue: %v", err)
-				return nil, fmt.Errorf("failed to check queue: %w", err)
-			}
-
-			if dueQueueItem != nil {
-				workerId := dueQueueItem.GetString("worker_id")
-				duration := dueQueueItem.GetInt("duration_days")
-				effectiveStartDate := dueQueueItem.GetString("start_date")
-
-				// Parse to get just the date part
-				parsedStartDate, _ := time.Parse(timeLayoutFull, effectiveStartDate)
-				effectiveStartDateYMD := formatDateToYMDGo(parsedStartDate)
-
-				// If queue item's start_date is in the past, start assignments from today
-				parsedEffectiveDate, _ := parseYMDToGoTime(effectiveStartDateYMD)
-				parsedToday, _ := parseYMDToGoTime(todayYMD)
-				if parsedEffectiveDate.Before(parsedToday) {
-					effectiveStartDateYMD = todayYMD
-				}
-
-				assignmentsCollection, err := dao.FindCollectionByNameOrId("assignments")
-				if err != nil {
-					return nil, fmt.Errorf("failed to find assignments collection: %w", err)
-				}
-
-				worker, err := dao.FindRecordById("workers", workerId)
-				if err != nil {
-					return nil, fmt.Errorf("failed to find worker: %w", err)
-				}
-
-				for i := 0; i < duration; i++ {
-					assignmentDate, err := addDaysToYMDGo(effectiveStartDateYMD, i)
-					if err != nil {
-						log.Printf("Error calculating assignment date: %v", err)
-						continue
-					}
-					assignmentDateFull := assignmentDate + " 00:00:00.000Z"
-
-					// Check if an assignment for this worker and date already exists
-					// Use assignmentDate (YMD)
-					existingAssignment, err := dao.FindFirstRecordByFilter(
-						"assignments",
-						"worker_id = {:workerId} AND date = {:date}",
-						dbx.Params{"workerId": workerId, "date": assignmentDate},
-					)
-
-					if err != nil && err.Error() != "sql: no rows in result set" {
-						log.Printf("Error checking for existing assignment: %v", err)
-						continue
-					}
-
-					if existingAssignment != nil {
-						if existingAssignment.GetString("status") != "assigned" {
-							existingAssignment.Set("status", "assigned") // Ensure it's marked assigned
-							if err := dao.SaveRecord(existingAssignment); err != nil {
-								log.Printf("Error updating assignment status: %v", err)
-							}
-						}
-						log.Printf("Assignment for %s on %s already exists, status updated if needed.", worker.GetString("name"), assignmentDate)
-					} else {
-						newAssignment := models.NewRecord(assignmentsCollection)
-						newAssignment.Set("worker_id", workerId)
-						newAssignment.Set("date", assignmentDateFull)
-						newAssignment.Set("status", "assigned")
-						if err := dao.SaveRecord(newAssignment); err != nil {
-							log.Printf("Error creating assignment: %v", err)
-						}
-					}
-				}
-
-				// Remove from queue
-				if err := dao.DeleteRecord(dueQueueItem); err != nil {
-					log.Printf("Error deleting queue item: %v", err)
-				}
-
-				// Update worker's last_assigned_date
-				lastAssignmentDate, err := addDaysToYMDGo(effectiveStartDateYMD, duration-1)
-				if err == nil {
-					worker.Set("last_assigned_date", lastAssignmentDate+" 00:00:00.000Z")
-					if err := dao.SaveRecord(worker); err != nil {
-						log.Printf("Error updating worker's last_assigned_date: %v", err)
-					}
-				}
-
-				logDetails := map[string]interface{}{
-					"worker_id":     workerId,
-					"worker_name":   worker.GetString("name"),
-					"duration_days": duration,
-					"start_date":    effectiveStartDateYMD,
-				}
-				if logErr := logActionGo(dao, "queue_processed", logDetails); logErr != nil {
-					log.Printf("Failed to log 'queue_processed' action: %v", logErr)
-				}
-
-				log.Printf("Assigned %s for %d days starting %s from queue.", worker.GetString("name"), duration, effectiveStartDateYMD)
-				return map[string]interface{}{
-					"message":            "Worker assigned from queue.",
-					"assigned_worker_id": workerId,
-					"duration":           duration,
-				}, nil
-			}
-
-			// 3. Random assignment if no one assigned and queue is empty or not due
-			log.Println("No due queue item. Attempting random assignment.")
-			workers, err := dao.FindRecordsByFilter(
-				"workers",
-				"1=1 ORDER BY last_assigned_date ASC NULLS FIRST, created ASC", // Prioritize those never assigned or oldest last_assigned_date
-				"id", 0, 100, // Get all workers, up to a reasonable limit
-			)
-
-			if err != nil {
-				log.Printf("Error finding workers for random assignment: %v", err)
-				return nil, fmt.Errorf("failed to find workers: %w", err)
-			}
-
-			if len(workers) == 0 {
-				log.Println("No workers available for random assignment.")
-				logDetails := map[string]interface{}{
-					"reason": "No workers in the system.",
-				}
-				if logErr := logActionGo(dao, "random_assignment_failed", logDetails); logErr != nil {
-					log.Printf("Failed to log 'random_assignment_failed' action: %v", logErr)
-				}
-				return map[string]interface{}{"error": "No workers available."}, fmt.Errorf("no workers available")
-			}
-
-			selectedWorker := workers[0] // Simplest: pick the first one from the sorted list
-			assignmentsCollection, err := dao.FindCollectionByNameOrId("assignments")
-			if err != nil {
-				return nil, fmt.Errorf("failed to find assignments collection: %w", err)
-			}
-
-			newAssignment := models.NewRecord(assignmentsCollection)
-			newAssignment.Set("worker_id", selectedWorker.Id)
-			newAssignment.Set("date", todayFull)
-			newAssignment.Set("status", "assigned")
-			if err := dao.SaveRecord(newAssignment); err != nil {
-				log.Printf("Error creating random assignment: %v", err)
-				return nil, fmt.Errorf("failed to create assignment: %w", err)
-			}
-
-			selectedWorker.Set("last_assigned_date", todayFull)
-			if err := dao.SaveRecord(selectedWorker); err != nil {
-				log.Printf("Error updating worker's last_assigned_date: %v", err)
-			}
-
-			logDetails := map[string]interface{}{
-				"worker_id":   selectedWorker.Id,
-				"worker_name": selectedWorker.GetString("name"),
-				"date":        todayYMD,
-			}
-			if logErr := logActionGo(dao, "randomly_assigned", logDetails); logErr != nil {
-				log.Printf("Failed to log 'randomly_assigned' action: %v", logErr)
-			}
-
-			log.Printf("Randomly assigned %s for %s.", selectedWorker.GetString("name"), todayYMD)
-			return map[string]interface{}{
-				"message":            "Worker randomly assigned.",
-				"assigned_worker_id": selectedWorker.Id,
-			}, nil
-		}
-
-		// POST /api/dishduty/trigger-daily-assignment
-		e.Router.AddRoute(echo.Route{
-			Method: http.MethodPost,
-			Path:   "/api/dishduty/trigger-daily-assignment",
-			Handler: func(c echo.Context) error {
-				result, err := processDailyAssignments()
-				if err != nil {
-					log.Printf("Error in daily assignment trigger: %v", err)
-					logDetails := map[string]interface{}{
-						"error": err.Error(),
-					}
-					if logErr := logActionGo(dao, "daily_assignment_error", logDetails); logErr != nil {
-						log.Printf("Failed to log 'daily_assignment_error' action: %v", logErr)
-					}
-					return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error during daily assignment.", err)
-				}
-				return c.JSON(http.StatusOK, result)
+				logActionGo(dao, "added_to_queue", map[string]interface{}{"worker_id": worker.Id, "worker_name": worker.GetString("name"), "duration_days": req.DurationDays, "start_date": startDateYMD, "order": order})
+				return c.JSON(http.StatusCreated, map[string]interface{}{"message": "Worker added to queue.", "data": newQueueRecord})
 			},
 		})
 
@@ -720,465 +462,307 @@ func main() {
 			Method: http.MethodGet,
 			Path:   "/api/dishduty/current-assignee",
 			Handler: func(c echo.Context) error {
-				todayYMD := getTodayYMDGo()
-				// todayFull := todayYMD + " 00:00:00.000Z" // Unused
+				if err := ensureDailyAssignmentGo(dao); err != nil {
+					log.Printf("Error during ensureDailyAssignmentGo: %v. Attempting to fetch current assignee anyway.", err)
+				}
 
-				// Use todayYMD for date comparison
-				currentAssignment, err := dao.FindFirstRecordByFilter(
-					"assignments",
-					"date = {:today} AND status = 'assigned'",
-					dbx.Params{"today": todayYMD},
+				// Corrected filter for fetching today's assignment
+				todayStart := time.Now().UTC().Truncate(24 * time.Hour)
+				todayEnd := todayStart.Add(24*time.Hour - 1*time.Nanosecond) // End of the day
+				todayYMDForLog := todayStart.Format(timeLayoutYMD)           // For logging if not found
+
+				filter := dbx.NewExp(
+					"date >= {:startOfDay} AND date <= {:endOfDay} AND status = 'assigned'",
+					dbx.Params{
+						"startOfDay": todayStart.UTC().Format(timeLayoutFull),
+						"endOfDay":   todayEnd.UTC().Format(timeLayoutFull),
+					},
 				)
-
-				if err != nil && err.Error() != "sql: no rows in result set" {
-					log.Printf("Error fetching current assignee: %v", err)
-					return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
-				}
-
-				if currentAssignment != nil {
-					workerId := currentAssignment.GetString("worker_id")
-					worker, err := dao.FindRecordById("workers", workerId)
-					if err != nil {
-						log.Printf("Error fetching worker details: %v", err)
-						return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
-					}
-
-					return c.JSON(http.StatusOK, map[string]interface{}{
-						"date":        todayYMD,
-						"worker_id":   worker.Id,
-						"worker_name": worker.GetString("name"),
-						"status":      currentAssignment.GetString("status"),
-					})
-				} else {
-					// If no direct assignment, try to run daily assignment
-					log.Printf("No current assignee for %s, attempting to process daily assignments.", todayYMD)
-					processingResult, err := processDailyAssignments()
-					if err != nil {
-						log.Printf("Error processing daily assignments: %v", err)
-						return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
-					}
-
-					if workerId, ok := processingResult["assigned_worker_id"].(string); ok && workerId != "" {
-						worker, err := dao.FindRecordById("workers", workerId)
-						if err != nil {
-							log.Printf("Error fetching newly assigned worker details: %v", err)
-							return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
-						}
-
-						return c.JSON(http.StatusOK, map[string]interface{}{
-							"date":        todayYMD,
-							"worker_id":   worker.Id,
-							"worker_name": worker.GetString("name"),
-							"status":      "assigned", // Assumed from processing
-							"message":     processingResult["message"],
-						})
-					}
-
-					return c.JSON(http.StatusNotFound, map[string]interface{}{
-						"message": "No worker is currently assigned for today.",
-						"details": processingResult,
-					})
-				}
-			},
-		})
-
-		// POST /api/dishduty/mark-not-done
-		e.Router.AddRoute(echo.Route{
-			Method: http.MethodPost,
-			Path:   "/api/dishduty/mark-not-done",
-			Handler: func(c echo.Context) error {
-				requestData := struct {
-					Date          string `json:"date"`
-					AdminPassword string `json:"admin_password"`
-				}{}
-
-				if err := c.Bind(&requestData); err != nil {
-					return apis.NewBadRequestError("Failed to parse request data.", err)
-				}
-
-				if !isAdminGo(requestData.AdminPassword) {
-					return apis.NewForbiddenError("Forbidden: Invalid admin password.", nil)
-				}
-
-				if requestData.Date == "" {
-					return apis.NewBadRequestError("Bad Request: 'date' (for yesterday's task) is required.", nil)
-				}
-				yesterdayYMD := requestData.Date // Expecting YYYY-MM-DD
-				// yesterdayFull := yesterdayYMD + " 00:00:00.000Z" // Unused
-				todayYMD := getTodayYMDGo()
-				todayFull := todayYMD + " 00:00:00.000Z" // Used later for newTodayAssignment
-
-				// Find the assignment to mark as not done
-				// Use yesterdayYMD for date comparison
-				assignmentToMark, err := dao.FindFirstRecordByFilter(
-					"assignments",
-					"date = {:date}",
-					dbx.Params{"date": yesterdayYMD},
-				)
+				var assignmentRecord models.Record
+				err := dao.RecordQuery("assignments").
+					AndWhere(filter).
+					Limit(1).
+					One(&assignmentRecord)
 
 				if err != nil {
-					if err.Error() == "sql: no rows in result set" {
-						return apis.NewNotFoundError(fmt.Sprintf("Not Found: No assignment found for date %s.", yesterdayYMD), nil)
+					isNoRowsError := errors.Is(err, sql.ErrNoRows) ||
+						strings.Contains(strings.ToLower(err.Error()), "no record found") || // PocketBase specific
+						strings.Contains(strings.ToLower(err.Error()), "no rows in result set") // Generic SQL
+
+					if isNoRowsError {
+						log.Printf("No current assignment found for today (%s). Returning 404.", todayYMDForLog)
+						// Return 404 or a specific structure indicating N/A
+						return c.JSON(http.StatusNotFound, map[string]string{"message": "No assignee found for today."})
 					}
-					log.Printf("Error finding assignment to mark: %v", err)
-					return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
+					log.Printf("Error fetching current assignment for today (%s): %v", todayYMDForLog, err)
+					return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to fetch current assignment."})
 				}
 
-				originalStatus := assignmentToMark.GetString("status")
-				failedWorkerId := assignmentToMark.GetString("worker_id")
-				assignmentToMark.Set("status", "not_done")
-				if err := dao.SaveRecord(assignmentToMark); err != nil {
-					log.Printf("Error updating assignment status: %v", err)
-					return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
+				// If err is nil, .One() found a record.
+				// A check for assignmentRecord.Id == "" might be redundant if .One() always errors on no rows.
+				// However, keeping it as a safeguard if some DB driver behaves differently.
+				if assignmentRecord.Id == "" {
+					log.Printf("No current assignment found for today (%s) (record ID empty after query). Returning 404.", todayYMDForLog)
+					// Return 404 or a specific structure indicating N/A
+					return c.JSON(http.StatusNotFound, map[string]string{"message": "No assignee found for today."})
 				}
 
-				failedWorker, err := dao.FindRecordById("workers", failedWorkerId)
-				if err != nil {
-					log.Printf("Error finding failed worker: %v", err)
-					return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
+				workerID := assignmentRecord.GetString("worker_id")
+				assigneeRecord, errWorker := dao.FindRecordById("workers", workerID) // Renamed worker to assigneeRecord for clarity
+				if errWorker != nil {
+					log.Printf("Error fetching worker details for ID %s: %v", workerID, errWorker)
+					return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to fetch worker details."})
 				}
-
-				// Reassign for Today
-				// 1. Cancel/remove any existing assignment for today IF it's not the failed worker
-				// Use todayYMD for date comparison
-				existingTodayAssignment, err := dao.FindFirstRecordByFilter(
-					"assignments",
-					"date = {:today}",
-					dbx.Params{"today": todayYMD},
-				)
-
-				if err != nil && err.Error() != "sql: no rows in result set" {
-					log.Printf("Error checking for existing today's assignment: %v", err)
-					return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
-				}
-
-				todayReassigned := false
-				if existingTodayAssignment != nil && existingTodayAssignment.GetString("worker_id") != failedWorkerId {
-					log.Printf("Cancelling existing assignment for %s on %s to reassign to %s",
-						existingTodayAssignment.GetString("worker_id"), todayYMD, failedWorker.GetString("name"))
-
-					if err := dao.DeleteRecord(existingTodayAssignment); err != nil {
-						log.Printf("Error deleting existing assignment: %v", err)
-						return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
-					}
-
-					logDetails := map[string]interface{}{
-						"date":                    todayYMD,
-						"cancelled_worker_id":     existingTodayAssignment.GetString("worker_id"),
-						"reassigned_to_worker_id": failedWorkerId,
-					}
-					if logErr := logActionGo(dao, "assignment_cancelled_for_reassignment", logDetails); logErr != nil {
-						log.Printf("Failed to log 'assignment_cancelled_for_reassignment' action: %v", logErr)
-					}
-				}
-
-				// 2. Create new assignment for failed_worker_id for today, if not already assigned to them
-				if existingTodayAssignment == nil || existingTodayAssignment.GetString("worker_id") != failedWorkerId {
-					assignmentsCollection, err := dao.FindCollectionByNameOrId("assignments")
-					if err != nil {
-						log.Printf("Error finding assignments collection: %v", err)
-						return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
-					}
-
-					newTodayAssignment := models.NewRecord(assignmentsCollection)
-					newTodayAssignment.Set("worker_id", failedWorkerId)
-					newTodayAssignment.Set("date", todayFull)
-					newTodayAssignment.Set("status", "assigned") // Reassignment is 'assigned'
-
-					if err := dao.SaveRecord(newTodayAssignment); err != nil {
-						log.Printf("Error creating new assignment: %v", err)
-						return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
-					}
-
-					todayReassigned = true
-
-					// Update failed worker's last_assigned_date if this is a new assignment for them today
-					failedWorker.Set("last_assigned_date", todayFull)
-					if err := dao.SaveRecord(failedWorker); err != nil {
-						log.Printf("Error updating worker's last_assigned_date: %v", err)
-					}
-				}
-
-				// Shift subsequent assignments and queue items by one day
-				// 1. Shift future assignments
-				futureAssignments, err := dao.FindRecordsByFilter(
-					"assignments",
-					"date > {:today} ORDER BY date",
-					"id", 0, 100, // Required parameters for v0.19.4: sort field, offset, limit
-					dbx.Params{"today": todayYMD}, // Corrected to use YMD for date field
-				)
-
-				if err != nil && err.Error() != "sql: no rows in result set" {
-					log.Printf("Error finding future assignments: %v", err)
-					return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
-				}
-
-				for _, assign := range futureAssignments {
-					originalDateStr := assign.GetString("date")
-					originalDate, err := time.Parse(timeLayoutFull, originalDateStr)
-					if err != nil {
-						log.Printf("Error parsing assignment date: %v", err)
-						continue
-					}
-
-					newDateYMD, err := addDaysToYMDGo(formatDateToYMDGo(originalDate), 1)
-					if err != nil {
-						log.Printf("Error calculating new date: %v", err)
-						continue
-					}
-
-					newDate, err := time.Parse(timeLayoutYMD, newDateYMD)
-					if err != nil {
-						log.Printf("Error parsing new date: %v", err)
-						continue
-					}
-
-					assign.Set("date", newDate.Format(timeLayoutFull))
-					if err := dao.SaveRecord(assign); err != nil {
-						log.Printf("Error updating assignment date: %v", err)
-					}
-				}
-
-				// 2. Shift queue items
-				queueItems, err := dao.FindRecordsByFilter(
-					"assignment_queue",
-					"1=1 ORDER BY {{order}} ASC", // Process all queue items
-					"id", 0, 100,                 // Required parameters for v0.19.4: sort field, offset, limit
-					dbx.Params{},
-				)
-
-				if err != nil && err.Error() != "sql: no rows in result set" {
-					log.Printf("Error finding queue items: %v", err)
-					return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
-				}
-
-				for _, item := range queueItems {
-					originalStartDateStr := item.GetString("start_date")
-					originalStartDate, err := time.Parse(timeLayoutFull, originalStartDateStr)
-					if err != nil {
-						log.Printf("Error parsing queue item start date: %v", err)
-						continue
-					}
-
-					originalStartDateYMD := formatDateToYMDGo(originalStartDate)
-					parsedOriginalDate, _ := parseYMDToGoTime(originalStartDateYMD)
-					parsedToday, _ := parseYMDToGoTime(todayYMD)
-
-					// Only shift if its start date is after or on the day the penalty is applied
-					if parsedOriginalDate.After(parsedToday) || parsedOriginalDate.Equal(parsedToday) {
-						newStartDateYMD, err := addDaysToYMDGo(originalStartDateYMD, 1)
-						if err != nil {
-							log.Printf("Error calculating new start date: %v", err)
-							continue
-						}
-
-						newStartDate, err := time.Parse(timeLayoutYMD, newStartDateYMD)
-						if err != nil {
-							log.Printf("Error parsing new start date: %v", err)
-							continue
-						}
-
-						item.Set("start_date", newStartDate.Format(timeLayoutFull))
-						if err := dao.SaveRecord(item); err != nil {
-							log.Printf("Error updating queue item start date: %v", err)
-						}
-					}
-				}
-
-				logDetails := map[string]interface{}{
-					"date":               yesterdayYMD,
-					"original_status":    originalStatus,
-					"failed_worker_id":   failedWorkerId,
-					"failed_worker_name": failedWorker.GetString("name"),
-					"reassigned_today":   todayReassigned,
-					"today_reassigned_to": func() interface{} {
-						if todayReassigned {
-							return failedWorkerId
-						}
-						return nil
-					}(),
-				}
-				if logErr := logActionGo(dao, "marked_not_done", logDetails); logErr != nil {
-					log.Printf("Failed to log 'marked_not_done' action: %v", logErr)
-				}
+				// Calendar route has been moved to the main router setup area (below)
 
 				return c.JSON(http.StatusOK, map[string]interface{}{
-					"message": fmt.Sprintf("Assignment for %s marked 'not_done'. Worker %s has been reassigned for %s if they weren't already. Subsequent assignments shifted.",
-						yesterdayYMD, failedWorker.GetString("name"), todayYMD),
+					"worker_id":   assigneeRecord.Id,
+					"worker_name": assigneeRecord.GetString("name"),
+					"date":        assignmentRecord.GetTime("date").Format(timeLayoutYMD),
 				})
 			},
 		})
 
-		// GET /api/dishduty/calendar
+		// GET /api/dishduty/assignments
+		e.Router.AddRoute(echo.Route{
+			Method: http.MethodGet,
+			Path:   "/api/dishduty/assignments",
+			Handler: func(c echo.Context) error {
+				startDateStr := c.QueryParam("start_date")
+				endDateStr := c.QueryParam("end_date")
+				if startDateStr == "" || endDateStr == "" {
+					return apis.NewBadRequestError("start_date and end_date query parameters are required.", nil)
+				}
+				dateRegex := regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+				if !dateRegex.MatchString(startDateStr) || !dateRegex.MatchString(endDateStr) {
+					return apis.NewBadRequestError("Invalid date format. Use YYYY-MM-DD.", nil)
+				}
+
+				startDateTime, _ := time.Parse(timeLayoutYMD, startDateStr)
+				endDateTime, _ := time.Parse(timeLayoutYMD, endDateStr)
+				endDateTime = endDateTime.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
+
+				records, err := dao.FindRecordsByFilter(
+					"assignments",
+					"date >= {:startDate} AND date <= {:endDate}",
+					"date DESC", 0, 0,
+					dbx.Params{
+						"startDate": startDateTime.Format(timeLayoutFull),
+						"endDate":   endDateTime.Format(timeLayoutFull),
+					},
+				)
+				if err != nil {
+					log.Printf("Error fetching assignments: %v", err)
+					return apis.NewApiError(http.StatusInternalServerError, "Failed to fetch assignments.", err)
+				}
+				result := []map[string]interface{}{}
+				for _, record := range records {
+					worker, _ := dao.FindRecordById("workers", record.GetString("worker_id"))
+					workerName := "Unknown"
+					if worker != nil {
+						workerName = worker.GetString("name")
+					}
+					result = append(result, map[string]interface{}{
+						"id": record.Id, "worker_name": workerName,
+						"date": record.GetTime("date").Format(timeLayoutYMD), "status": record.GetString("status"),
+					})
+				}
+				return c.JSON(http.StatusOK, result)
+			},
+		})
+
+		// PATCH /api/dishduty/assignments/:id/status
+		e.Router.AddRoute(echo.Route{
+			Method: http.MethodPatch,
+			Path:   "/api/dishduty/assignments/:id/status",
+			Handler: func(c echo.Context) error {
+				assignmentID := c.PathParam("id")
+				requestData := struct {
+					Status        string `json:"status"`
+					AdminPassword string `json:"admin_password"`
+				}{}
+				if err := c.Bind(&requestData); err != nil {
+					return apis.NewBadRequestError("Failed to parse request data.", err)
+				}
+				if !isAdminGo(requestData.AdminPassword) {
+					return apis.NewForbiddenError("Forbidden: Invalid admin password.", nil)
+				}
+				validStatuses := map[string]bool{"assigned": true, "done": true, "not_done": true}
+				if !validStatuses[requestData.Status] {
+					return apis.NewBadRequestError("Invalid status value.", nil)
+				}
+				assignment, err := dao.FindRecordById("assignments", assignmentID)
+				if err != nil {
+					return apis.NewNotFoundError("Assignment not found.", err)
+				}
+				assignment.Set("status", requestData.Status)
+				if err := dao.SaveRecord(assignment); err != nil {
+					log.Printf("Error updating assignment status: %v", err)
+					return apis.NewApiError(http.StatusInternalServerError, "Failed to update status.", err)
+				}
+				if requestData.Status == "not_done" {
+					workerName := "Unknown"
+					worker, _ := dao.FindRecordById("workers", assignment.GetString("worker_id"))
+					if worker != nil {
+						workerName = worker.GetString("name")
+					}
+					logActionGo(dao, "marked_not_done", map[string]interface{}{
+						"assignment_id": assignment.Id,
+						"worker_id":     assignment.GetString("worker_id"),
+						"worker_name":   workerName,
+						"date":          assignment.GetTime("date").Format(timeLayoutYMD),
+					})
+				}
+				return c.JSON(http.StatusOK, map[string]interface{}{"message": "Assignment status updated."})
+			},
+		})
+
+		// GET /api/dishduty/action-log
+		e.Router.AddRoute(echo.Route{
+			Method: http.MethodGet,
+			Path:   "/api/dishduty/action-log",
+			Handler: func(c echo.Context) error {
+				records, err := dao.FindRecordsByFilter("action_log", "1=1", "timestamp DESC", 50, 0)
+				if err != nil {
+					log.Printf("Error fetching action log: %v", err)
+					return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to fetch action log."})
+				}
+				return c.JSON(http.StatusOK, records)
+			},
+		})
+
+		// GET /api/dishduty/calendar - MOVED HERE
 		e.Router.AddRoute(echo.Route{
 			Method: http.MethodGet,
 			Path:   "/api/dishduty/calendar",
 			Handler: func(c echo.Context) error {
-				startDateParam := c.QueryParam("start_date")
-				endDateParam := c.QueryParam("end_date")
+				startDateStr := c.QueryParam("start_date")
+				endDateStr := c.QueryParam("end_date")
 
-				if startDateParam == "" || endDateParam == "" {
-					return apis.NewBadRequestError("Bad Request: start_date and end_date query parameters are required.", nil)
+				if startDateStr == "" || endDateStr == "" {
+					return c.JSON(http.StatusBadRequest, map[string]string{"error": "start_date and end_date query parameters are required."})
 				}
 
-				// Validate date format (basic check)
-				dateRegex := `^\d{4}-\d{2}-\d{2}$`
-				startDateMatch, err := regexp.MatchString(dateRegex, startDateParam)
-				if err != nil || !startDateMatch {
-					return apis.NewBadRequestError("Bad Request: start_date must be in YYYY-MM-DD format.", nil)
+				dateRegex := regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+				if !dateRegex.MatchString(startDateStr) || !dateRegex.MatchString(endDateStr) {
+					return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid date format. Use YYYY-MM-DD."})
 				}
 
-				endDateMatch, err := regexp.MatchString(dateRegex, endDateParam)
-				if err != nil || !endDateMatch {
-					return apis.NewBadRequestError("Bad Request: end_date must be in YYYY-MM-DD format.", nil)
+				responseData := CalendarResponse{
+					Assignments:       make([]CalendarEntry, 0),
+					QueuedAssignments: make([]CalendarEntry, 0),
 				}
 
-				// startDateFull := startDateParam + " 00:00:00.000Z" // Unused
-				// endDateFull := endDateParam + " 23:59:59.999Z" // Ensure end of day // Unused
-
-				calendarEvents := []map[string]interface{}{}
-
-				// 1. Fetch actual assignments
-				assignments, err := dao.FindRecordsByFilter(
-					"assignments",
-					"date >= {:start} AND date <= {:end} ORDER BY date",
-					"id", 0, 100, // Required parameters for v0.19.4: sort field, offset, limit
-					dbx.Params{"start": startDateParam, "end": endDateParam}, // Corrected to use YMD for date fields
+				// Fetch actual assignments
+				assignmentFilterExp := dbx.NewExp(
+					"date >= {:startDate} AND date <= {:endDate}",
+					dbx.Params{
+						"startDate": startDateStr,
+						"endDate":   endDateStr,
+					},
 				)
+				assignmentRecords := []*models.Record{}
+				errAssignments := dao.RecordQuery("assignments").
+					AndWhere(assignmentFilterExp).
+					OrderBy("date DESC").
+					All(&assignmentRecords)
 
-				if err != nil && err.Error() != "sql: no rows in result set" {
-					log.Printf("Error finding assignments for calendar: %v", err)
-					return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
+				if errAssignments != nil && !errors.Is(errAssignments, sql.ErrNoRows) {
+					log.Printf("Error fetching calendar assignments: %v", errAssignments)
+					return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to fetch calendar assignments."})
 				}
 
-				// Process assignments
-				for _, assignment := range assignments {
-					workerId := assignment.GetString("worker_id")
-					worker, err := dao.FindRecordById("workers", workerId)
-					if err != nil {
-						log.Printf("Error finding worker for assignment: %v", err)
-						continue
-					}
-
-					dateStr := assignment.GetString("date")
-					date, err := time.Parse(timeLayoutFull, dateStr)
-					if err != nil {
-						log.Printf("Error parsing assignment date: %v", err)
-						continue
-					}
-
-					calendarEvents = append(calendarEvents, map[string]interface{}{
-						"title": worker.GetString("name"),
-						"start": formatDateToYMDGo(date),
-						"extendedProps": map[string]interface{}{
-							"worker_id": workerId,
-							"status":    assignment.GetString("status"),
-							"type":      "assignment",
-						},
-					})
-				}
-
-				// 2. Project queue items into the future
-				// First, find the last actual assignment date
-				lastAssignmentDate := getTodayYMDGo() // Default to today if no assignments
-				if len(assignments) > 0 {
-					// Find the latest assignment date
-					var latestDate time.Time
-					for _, assignment := range assignments {
-						dateStr := assignment.GetString("date")
-						date, err := time.Parse(timeLayoutFull, dateStr)
-						if err != nil {
-							continue
+				if errAssignments == nil { // Process if no error or if error is sql.ErrNoRows (records will be empty)
+					for _, record := range assignmentRecords {
+						worker, _ := dao.FindRecordById("workers", record.GetString("worker_id"))
+						workerName := "Unknown"
+						if worker != nil {
+							workerName = worker.GetString("name")
 						}
-						if latestDate.IsZero() || date.After(latestDate) {
-							latestDate = date
-						}
-					}
-					if !latestDate.IsZero() {
-						lastAssignmentDate = formatDateToYMDGo(latestDate)
-					}
-				}
+						// Determine status for calendar display (past_done, past_not_done, assigned)
+						assignmentDate := record.GetTime("date")
+						today := time.Now().UTC().Truncate(24 * time.Hour)
+						status := record.GetString("status")
+						calendarStatus := status // Default to actual status
 
-				// Get queue items
-				queueItems, err := dao.FindRecordsByFilter(
-					"assignment_queue",
-					"1=1 ORDER BY {{order}} ASC", // Order by queue position
-					"id", 0, 100,                 // Required parameters for v0.19.4: sort field, offset, limit
-					dbx.Params{},
-				)
+						if assignmentDate.Before(today) {
+							if status == "done" {
+								calendarStatus = "past_done"
+							} else if status == "not_done" || status == "assigned" { // Treat past assigned as not_done for calendar
+								calendarStatus = "past_not_done"
+							}
 
-				if err != nil && err.Error() != "sql: no rows in result set" {
-					log.Printf("Error finding queue items for calendar: %v", err)
-					return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
-				}
-
-				// Project queue items
-				currentDate, err := addDaysToYMDGo(lastAssignmentDate, 1) // Start from day after last assignment
-				if err != nil {
-					log.Printf("Error calculating start date for queue projection: %v", err)
-					return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
-				}
-
-				endDate, err := parseYMDToGoTime(endDateParam)
-				if err != nil {
-					log.Printf("Error parsing end date: %v", err)
-					return apis.NewApiError(http.StatusInternalServerError, "Internal Server Error.", err)
-				}
-
-				// Process each queue item
-				for _, queueItem := range queueItems {
-					workerId := queueItem.GetString("worker_id")
-					worker, err := dao.FindRecordById("workers", workerId)
-					if err != nil {
-						log.Printf("Error finding worker for queue item: %v", err)
-						continue
-					}
-
-					durationDays := queueItem.GetInt("duration_days")
-
-					// Add projected assignments for this queue item
-					for i := 0; i < durationDays; i++ {
-						projectedDate, err := addDaysToYMDGo(currentDate, i)
-						if err != nil {
-							log.Printf("Error calculating projected date: %v", err)
-							continue
+						} else if assignmentDate.Equal(today) {
+							calendarStatus = status // "assigned", "done", "not_done"
+						} else { // Future assignment
+							calendarStatus = "assigned" // Future assignments are just "assigned"
 						}
 
-						// Check if the projected date is within the requested range
-						projectedDateTime, err := parseYMDToGoTime(projectedDate)
-						if err != nil {
-							log.Printf("Error parsing projected date: %v", err)
-							continue
-						}
-
-						if projectedDateTime.After(endDate) {
-							break // Stop if we've gone beyond the requested end date
-						}
-
-						calendarEvents = append(calendarEvents, map[string]interface{}{
-							"title": worker.GetString("name") + " (queued)",
-							"start": projectedDate,
-							"extendedProps": map[string]interface{}{
-								"worker_id":     workerId,
-								"status":        "queued",
-								"type":          "queue_projection",
-								"queue_item_id": queueItem.Id,
-								"queue_order":   queueItem.GetInt("order"),
-							},
+						responseData.Assignments = append(responseData.Assignments, CalendarEntry{
+							Date:       record.GetTime("date").Format(timeLayoutYMD),
+							WorkerID:   record.GetString("worker_id"),
+							WorkerName: workerName,
+							Status:     calendarStatus,
 						})
 					}
-
-					// Move current date forward for the next queue item
-					currentDate, err = addDaysToYMDGo(currentDate, durationDays)
-					if err != nil {
-						log.Printf("Error calculating next start date: %v", err)
-						break
-					}
 				}
 
-				return c.JSON(http.StatusOK, calendarEvents)
+				// Fetch queued assignments
+				// Queued items are relevant if their start_date is within the requested calendar range OR
+				// if they don't have a specific end_date but are generally "upcoming".
+				// For simplicity, let's fetch queued items whose start_date is before or on the endDateStr of the calendar view.
+				// This might need refinement based on how "duration_days" for queued items should affect their visibility in the calendar.
+				// For now, we'll list them if their start_date is within the view.
+				queuedFilterExp := dbx.NewExp(
+					"start_date <= {:endDate}", // Show if it starts before or on the last day of the calendar view
+					dbx.Params{"endDate": endDateStr},
+				)
+				queuedRecords := []*models.Record{}
+				errQueued := dao.RecordQuery("assignment_queue").
+					AndWhere(queuedFilterExp).
+					OrderBy("order ASC"). // Assuming 'order' field exists and is relevant
+					All(&queuedRecords)
+
+				if errQueued != nil && !errors.Is(errQueued, sql.ErrNoRows) {
+					log.Printf("Error fetching queued assignments: %v", errQueued)
+					// Potentially return error or just log and continue with empty queuedAssignments
+					// For now, let's log and continue, so assignments can still be shown.
+				}
+
+				if errQueued == nil {
+					for _, record := range queuedRecords {
+						worker, _ := dao.FindRecordById("workers", record.GetString("worker_id"))
+						workerName := "Unknown"
+						if worker != nil {
+							workerName = worker.GetString("name")
+						}
+						// For queued items, the "date" is their start_date.
+						// Status is "queued".
+						// Duration could be used to display them over multiple days if the frontend supports it.
+						// Here, we just mark the start_date.
+						startDate := record.GetTime("start_date").Format(timeLayoutYMD)
+						// Optional: consider duration_days if the frontend is to show multi-day queued blocks
+						// duration := record.GetInt("duration_days")
+
+						responseData.QueuedAssignments = append(responseData.QueuedAssignments, CalendarEntry{
+							Date:       startDate,
+							WorkerID:   record.GetString("worker_id"),
+							WorkerName: workerName,
+							Status:     "queued",
+						})
+					}
+				}
+				return c.JSON(http.StatusOK, responseData)
 			},
 		})
+
+		go func() {
+			time.Sleep(3 * time.Second)
+			log.Println("Attempting initial daily assignment check after startup...")
+			if err := ensureDailyAssignmentGo(dao); err != nil {
+				log.Printf("Error during initial ensureDailyAssignmentGo: %v", err)
+			}
+		}()
 
 		return nil
 	})
@@ -1186,4 +770,145 @@ func main() {
 	if err := app.Start(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// --- Daily Assignment Logic ---
+func ensureDailyAssignmentGo(dao *daos.Dao) error {
+	log.Println("ensureDailyAssignmentGo: Checking for today's assignment...")
+	today := time.Now().UTC()
+	todayYMD := today.Format(timeLayoutYMD)
+	todayStart := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
+	// todayStart is: time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
+	todayEnd := todayStart.Add(24*time.Hour - 1*time.Nanosecond) // End of the day
+
+	// Check for existing assignment for today using a date range
+	existingAssignmentFilter := dbx.NewExp(
+		"date >= {:startOfDay} AND date <= {:endOfDay}",
+		dbx.Params{
+			"startOfDay": todayStart.UTC().Format(timeLayoutFull),
+			"endOfDay":   todayEnd.UTC().Format(timeLayoutFull),
+		},
+	)
+	var existingAssignment models.Record
+	errExisting := dao.RecordQuery("assignments").
+		AndWhere(existingAssignmentFilter).
+		Limit(1). // We only need one to see if any assignment exists for the day
+		One(&existingAssignment)
+	// errExisting could be sql.ErrNoRows if no assignment exists for today.
+
+	if errExisting == nil && existingAssignment.Id != "" { // Assignment found for today
+		log.Printf("ensureDailyAssignmentGo: Assignment for today (%s) already exists (ID: %s). Status: %s", todayYMD, existingAssignment.Id, existingAssignment.GetString("status"))
+		if existingAssignment.GetString("status") == "not_done" {
+			log.Printf("ensureDailyAssignmentGo: Today's assignment (%s) was 'not_done'. Deleting to reassign.", todayYMD)
+			if err := dao.DeleteRecord(&existingAssignment); err != nil {
+				log.Printf("ensureDailyAssignmentGo: Failed to delete 'not_done' assignment %s: %v", existingAssignment.Id, err)
+				return fmt.Errorf("failed to delete 'not_done' assignment: %w", err)
+			}
+		} else {
+			return nil
+		}
+	} else {
+		log.Printf("ensureDailyAssignmentGo: No assignment found for today (%s). Proceeding to assign.", todayYMD)
+	}
+
+	var workerToAssign *models.Record
+	var assignmentSource string
+
+	var dueQueuedAssignment models.Record
+	// todayStart is: time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
+	// For assignment_queue, start_date should be on or before the end of today.
+	// Instruction: types.DateTime{Time: todayStartOfDay.Add(23*time.Hour + 59*time.Minute + 59*time.Second)}
+	endOfTodayForQueueQuery := todayStart.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
+
+	errQueue := dao.RecordQuery("assignment_queue").
+		AndWhere(dbx.NewExp("start_date <= {:effectiveTodayEnd}", dbx.Params{"effectiveTodayEnd": endOfTodayForQueueQuery.UTC().Format(timeLayoutFull)})).
+		OrderBy("order ASC").
+		Limit(1).
+		One(&dueQueuedAssignment)
+
+	if errQueue == nil && dueQueuedAssignment.Id != "" { // Item found and ID is not empty
+		workerID := dueQueuedAssignment.GetString("worker_id")
+		worker, findErr := dao.FindRecordById("workers", workerID)
+		if findErr == nil && worker != nil {
+			workerToAssign = worker
+			assignmentSource = "queue_processed"
+			log.Printf("ensureDailyAssignmentGo: Assigning worker %s (ID: %s) from queue for %s.", worker.GetString("name"), worker.Id, todayYMD)
+			// last_assigned_date in workers is FieldTypeDate.
+			// todayStart is time.Date(...)
+			worker.Set("last_assigned_date", todayStart.Format(timeLayoutYMD))
+			if errSaveWorker := dao.SaveRecord(worker); errSaveWorker != nil {
+				log.Printf("ensureDailyAssignmentGo: Error updating last_assigned_date for worker %s from queue: %v", worker.GetString("name"), errSaveWorker)
+			}
+			if errDeleteQueue := dao.DeleteRecord(&dueQueuedAssignment); errDeleteQueue != nil { // Pass pointer to record for deletion
+				log.Printf("ensureDailyAssignmentGo: Error deleting queue item %s: %v", dueQueuedAssignment.Id, errDeleteQueue)
+			}
+		} else {
+			log.Printf("ensureDailyAssignmentGo: Error finding worker_id %s from queue item %s: %v.", workerID, dueQueuedAssignment.Id, findErr)
+		}
+	} else if errQueue != nil && !(errors.Is(errQueue, sql.ErrNoRows) ||
+		strings.Contains(strings.ToLower(errQueue.Error()), "no record found") ||
+		strings.Contains(strings.ToLower(errQueue.Error()), "no rows in result set")) {
+		// Log error only if it's not a "no rows" type of error (or similar "not found" messages)
+		log.Printf("ensureDailyAssignmentGo: Error fetching from assignment_queue: %v", errQueue)
+	}
+	// If sql.ErrNoRows or similar, workerToAssign remains nil, and logic proceeds to random assignment.
+
+	if workerToAssign == nil {
+		log.Println("ensureDailyAssignmentGo: No worker from queue. Attempting random assignment.")
+		allWorkers, findErr := dao.FindRecordsByFilter("workers", "1=1", "", 0, 0)
+		if findErr != nil || len(allWorkers) == 0 {
+			log.Printf("ensureDailyAssignmentGo: No workers for random assignment: %v", findErr)
+			return fmt.Errorf("no workers available for random assignment: %w", findErr)
+		}
+		var chosenWorker *models.Record
+		var oldestDate time.Time
+		firstUnassigned := true
+
+		for _, w := range allWorkers {
+			ladStr := w.GetString("last_assigned_date")
+			if ladStr == "" {
+				chosenWorker = w
+				break
+			}
+			ladTime, parseErr := time.Parse(timeLayoutFull, ladStr)
+			if parseErr != nil {
+				log.Printf("ensureDailyAssignmentGo: Error parsing last_assigned_date '%s' for worker %s: %v. Skipping.", ladStr, w.GetString("name"), parseErr)
+				continue
+			}
+			if firstUnassigned || ladTime.Before(oldestDate) {
+				chosenWorker = w
+				oldestDate = ladTime
+				firstUnassigned = false
+			}
+		}
+		if chosenWorker == nil && len(allWorkers) > 0 {
+			chosenWorker = allWorkers[0]
+		}
+
+		if chosenWorker != nil {
+			workerToAssign = chosenWorker
+			assignmentSource = "randomly_assigned"
+			log.Printf("ensureDailyAssignmentGo: Randomly assigning worker %s (ID: %s) for %s.", workerToAssign.GetString("name"), workerToAssign.Id, todayYMD)
+			workerToAssign.Set("last_assigned_date", todayStart.Format(timeLayoutFull))
+			if err := dao.SaveRecord(workerToAssign); err != nil {
+				log.Printf("ensureDailyAssignmentGo: Error updating last_assigned_date for randomly assigned worker %s: %v", workerToAssign.GetString("name"), err)
+			}
+		} else {
+			log.Println("ensureDailyAssignmentGo: No workers available to assign.")
+			return fmt.Errorf("no workers available to assign for %s", todayYMD)
+		}
+	}
+
+	assignmentsCollection, _ := dao.FindCollectionByNameOrId("assignments")
+	newAssignment := models.NewRecord(assignmentsCollection)
+	newAssignment.Set("worker_id", workerToAssign.Id)
+	newAssignment.Set("date", todayStart.Format(timeLayoutYMD))
+	newAssignment.Set("status", "assigned")
+	if err := dao.SaveRecord(newAssignment); err != nil {
+		log.Printf("ensureDailyAssignmentGo: Error saving new assignment for %s on %s: %v", workerToAssign.GetString("name"), todayYMD, err)
+		return fmt.Errorf("failed to save new assignment: %w", err)
+	}
+	log.Printf("ensureDailyAssignmentGo: Assigned worker %s (ID: %s) for %s. Source: %s. ID: %s", workerToAssign.GetString("name"), workerToAssign.Id, todayYMD, assignmentSource, newAssignment.Id)
+	logActionGo(dao, "assigned", map[string]interface{}{"worker_id": workerToAssign.Id, "worker_name": workerToAssign.GetString("name"), "date": todayYMD, "source": assignmentSource})
+	return nil
 }
